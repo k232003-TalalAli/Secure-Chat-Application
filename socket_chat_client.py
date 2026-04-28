@@ -88,7 +88,7 @@ class SocketChatClient:
             try:
                 self._listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self._listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self._listen_socket.bind((self.host, 0))  # auto port
+                self._listen_socket.bind((self.host, 0))  # automatic port allocation
                 self.port = self._listen_socket.getsockname()[1]
                 self._listen_socket.listen(4)
                 self._listen_socket.settimeout(1.0)
@@ -159,7 +159,6 @@ class SocketChatClient:
                 continue
 
             if not self._ensure_sender_connected():
-                # Preserve message until peer socket becomes reachable.
                 self._outgoing.put(message)
                 time.sleep(0.2)
                 continue

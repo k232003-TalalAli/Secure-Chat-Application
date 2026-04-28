@@ -29,7 +29,6 @@ def _init_firebase():
         try:
             cred = credentials.Certificate(key_path)
             firebase_admin.initialize_app(cred)
-            _debug("Firebase app initialized successfully")
         except Exception as exc:
             _debug(f"Firebase initialization failed: {exc}")
             raise
@@ -124,7 +123,6 @@ def _update_temp_field(account_id: str, field: str, value):
 
 def cache_data(include_chatlogs: bool = True):
     """Fetch everything from Firebase and write to temp files."""
-    _debug("cache_data() started")
 
     # ── app_data ──────────────────────────────────────────────────────────────
     des_doc = cast(Any, db.collection("app_data").document("config").get())
@@ -145,8 +143,7 @@ def cache_data(include_chatlogs: bool = True):
             "private_key": acc.get("private_key", ""),
         }
 
-    _write_app_data_temp({"des_key": des_key, "accounts": accounts})  # already hides itself
-    _debug(f"cache_data() wrote {len(accounts)} accounts to local temp cache")
+    _write_app_data_temp({"des_key": des_key, "accounts": accounts})
 
     if include_chatlogs:
         # ── chatlogs ──────────────────────────────────────────────────────────
@@ -158,7 +155,6 @@ def cache_data(include_chatlogs: bool = True):
         with open(TEMP_CHAT_DATA, "w", encoding="utf-8") as f:
             f.write(raw)
         _hide(TEMP_CHAT_DATA)
-        _debug("cache_data() updated local chat cache")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GET FROM CACHE (no DB traffic)

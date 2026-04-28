@@ -6,7 +6,7 @@ import json
 import secrets
 import socket
 import traceback
-
+from datetime import datetime
 import streamlit as st
 
 from connection_state_manager import get_connection_manager
@@ -209,6 +209,8 @@ def get_local_ip_address() -> str:
 def secure_username_check(username: str) -> bool:
     return database_helper.get_account_id_by_username(username) is not None
 
+def _current_timestamp() -> str:
+    return datetime.now().strftime("%I:%M %p")
 
 def secure_password_check(account_id: str, chat_password: str) -> bool:
     if len(chat_password) < 1 or len(chat_password) > 128:
@@ -260,7 +262,6 @@ def _get_socket_chat_client() -> SocketChatClient:
 def _sync_chatlogs_to_db_safe() -> None:
     try:
         database_helper.sync_chatlogs_from_temp_to_db()
-        _debug("Chatlogs synced to DB successfully")
     except Exception:
         _debug("Chatlogs sync to DB failed")
         traceback.print_exc()
@@ -324,18 +325,29 @@ def render_waiting_state() -> None:
 
 def _parse_chatlogs(raw_content: str) -> list[dict[str, str]]:
     parsed: list[dict[str, str]] = []
+
     for line in raw_content.splitlines():
         entry = line.strip()
         if not entry:
             continue
+
         try:
             payload = json.loads(entry)
+
             sender = str(payload.get("sender", "")).strip()
             encrypted = str(payload.get("encrypted", "")).strip()
+            timestamp = str(payload.get("timestamp", "")).strip()
+
             if sender and encrypted:
-                parsed.append({"sender": sender, "encrypted": encrypted})
+                parsed.append({
+                    "sender": sender,
+                    "encrypted": encrypted,
+                    "timestamp": timestamp
+                })
+
         except Exception:
             continue
+
     return parsed
 
 
@@ -344,7 +356,6 @@ def _load_chat_messages_from_temp() -> list[dict[str, str]]:
     encrypted_entries = _parse_chatlogs(raw)
     messages: list[dict[str, str]] = []
     if not encrypted_entries and raw.strip():
-        # Backward compatibility for older single-block encrypted chatlogs.
         try:
             legacy_text = msg_security.decrypt_message(raw.strip())
             if legacy_text:
@@ -357,10 +368,8 @@ def _load_chat_messages_from_temp() -> list[dict[str, str]]:
         encrypted = item.get("encrypted", "")
         sender = item.get("sender", "")
         try:
-            # Canonical storage format is DES ciphertext.
             text = msg_security.decrypt_message(encrypted)
         except Exception:
-            # Backward compatibility for any accidentally stored RSA payloads.
             try:
                 account_id = st.session_state.get("account_id")
                 des_encrypted = msg_security.RSA_decrypt(encrypted, account_id)
@@ -368,12 +377,26 @@ def _load_chat_messages_from_temp() -> list[dict[str, str]]:
             except Exception:
                 text = ""
         if sender and text:
-            messages.append({"sender": sender, "text": text})
+            messages.append({
+            "sender": sender,
+            "text": text,
+            "timestamp": item.get("timestamp", "")
+            })
     return messages
 
-
-def _append_encrypted_to_temp(sender: str, encrypted_text: str) -> None:
-    payload = json.dumps({"sender": sender, "encrypted": encrypted_text}, ensure_ascii=True)
+def _append_encrypted_to_temp(
+    sender: str,
+    encrypted_text: str,
+    timestamp: str
+) -> None:
+    payload = json.dumps(
+        {
+            "sender": sender,
+            "encrypted": encrypted_text,
+            "timestamp": timestamp
+        },
+        ensure_ascii=True
+    )
     database_helper.append_chatlogs_temp_line(payload)
 
 def _get_other_user_connection(my_username: str):
@@ -410,9 +433,14 @@ def _pull_incoming_socket_messages() -> None:
         my_ip = st.session_state.get("local_ip", "")
         my_port = str(getattr(client, "port", ""))
         simulator.log("msg", True, ["peer", f"{my_ip}:{my_port}", str(payload)])
-        st.session_state["chat_messages"].append({"sender": sender, "text": text})
-        # Store only DES ciphertext in local cache and DB.
-        _append_encrypted_to_temp(sender, des_encrypted)
+        timestamp = payload.get("timestamp", _current_timestamp())
+
+        st.session_state["chat_messages"].append({
+        "sender": sender,
+        "text": text,
+        "timestamp": timestamp
+         })
+        _append_encrypted_to_temp(sender, des_encrypted, timestamp)
         if sender != my_username:
             st.session_state["pending_outgoing_message"] = ""
 
@@ -440,12 +468,19 @@ def _render_message_feed() -> None:
                 white-space: pre-wrap;
                 box-shadow: 0 1px 3px rgba(0,0,0,0.3);
                 max-width: 100%;
+                min-width:120px;
             }
             .wa-bubble.sent { background: #2e5fc2; color: #fff; border-bottom-right-radius: 2px; }
             .wa-bubble.recv {
                 background: #2d4f7c; color: #deeeff;
                 border: 1px solid rgba(100,160,255,0.18);
                 border-bottom-left-radius: 2px;
+            }
+            .wa-time {
+            font-size: 11px;
+            opacity: 0.7;
+            margin-top: 4px;
+            text-align: right;
             }
         </style>
         """,
@@ -465,11 +500,16 @@ def _render_message_feed() -> None:
             is_mine = sender == my_username
             side    = "sent" if is_mine else "recv"
             safe_body = html.escape(body)
+            timestamp = html.escape(message.get("timestamp", ""))
+
             rows_html += (
-                f'<div class="wa-row {side}">'
-                f'<div class="wa-bubble {side}">{safe_body}</div>'
-                f'</div>'
-            )
+            f'<div class="wa-row {side}">'
+            f'<div class="wa-bubble {side}">'
+            f'{safe_body}'
+            f'<div class="wa-time">{timestamp}</div>'
+            f'</div>'
+            f'</div>'
+)
         st.markdown(
             f'<div class="wa-feed">{rows_html}</div>',
             unsafe_allow_html=True,
@@ -481,24 +521,19 @@ def render_chat_screen() -> None:
 
     manager = get_connection_manager()
     my_username = st.session_state.get("username", "")
-    _debug(f"render_chat_screen() for user={my_username!r}")
 
     st.subheader("Live Chat")
 
-    # Only keep Disconnect — Refresh is no longer needed
     btn_col1, btn_col2 = st.columns([1, 3])
     with btn_col1:
         disconnect_clicked = st.button("Disconnect", type="secondary", key="chat_disconnect_button", use_container_width=True)
 
     if disconnect_clicked:
-        _debug(f"Disconnect button pressed by {my_username!r}")
         account_id = st.session_state.get("account_id")
         if account_id:
             try:
                 database_helper.update_connection_info(account_id, None, None)
-                _debug(f"Cleared IP address for account_id={account_id!r}")
             except Exception:
-                _debug("Failed to clear IP address during disconnect")
                 traceback.print_exc()
         _sync_chatlogs_to_db_safe()
         simulator.log("login", True, [my_username])
@@ -512,8 +547,6 @@ def render_chat_screen() -> None:
         st.session_state["account_id"] = ""
         st.session_state["status_message"] = "You disconnected"
         st.rerun()
-
-    # Feed auto-refreshes every 2s inside fragment
     _render_message_feed()
 
     other_ip, other_port = _get_other_user_connection(my_username)
@@ -522,18 +555,21 @@ def render_chat_screen() -> None:
     input_disabled = not (other_ip and other_port)
     outgoing_message = st.chat_input("Type a message...", disabled=input_disabled)
     if outgoing_message:
-        _debug(f"Outgoing message submitted by {my_username!r}: {outgoing_message!r}")
         if not (other_ip and other_port):
             st.warning("Other user is disconnected.")
             return
-
+        timestamp = _current_timestamp()
         encrypted = msg_security.encrypt_message(outgoing_message.strip())
         simulator.log("des", False, [outgoing_message.strip(), str(encrypted)])
         receiver, _ = _get_other_user_connection(my_username)
         rsa_encrypted = msg_security.RSA_encrypt(encrypted, receiver)
         simulator.log("rsa", False, [str(encrypted), str(rsa_encrypted)])
         
-        payload = {"sender": my_username, "encrypted": rsa_encrypted}
+        payload = {
+            "sender": my_username,
+            "encrypted": rsa_encrypted,
+            "timestamp": timestamp
+}
         sent = socket_client.queue_message(payload)
         if sent:
             my_ip = st.session_state.get("local_ip", "")
@@ -543,8 +579,12 @@ def render_chat_screen() -> None:
                 False,
                 [f"{my_ip}:{my_port}", f"{other_ip}:{other_port}", str(payload)],
             )
-            st.session_state["chat_messages"].append({"sender": my_username, "text": outgoing_message.strip()})
-            _append_encrypted_to_temp(my_username, encrypted)
+            st.session_state["chat_messages"].append({
+            "sender": my_username,
+            "text": outgoing_message.strip(),
+            "timestamp": timestamp
+})
+            _append_encrypted_to_temp(my_username, encrypted,timestamp)
             st.session_state["pending_outgoing_message"] = outgoing_message.strip()
         else:
             st.warning("Message could not be sent right now.")
@@ -553,11 +593,9 @@ def render_chat_screen() -> None:
 def connect_user(username: str, chat_password: str) -> None:
     st.session_state["login_error"] = ""
     username = username.strip()
-    _debug(f"connect_user() called for username={username!r}")
 
     try:
         database_helper.cache_data(include_chatlogs=True)
-        _debug("connect_user() cache_data() completed successfully")
     except Exception:
         _debug("connect_user() cache_data() failed")
         traceback.print_exc()
@@ -584,7 +622,6 @@ def connect_user(username: str, chat_password: str) -> None:
 
     try:
         ip_address = get_local_ip_address()
-        _debug(f"connect_user() local ip resolved as {ip_address!r}")
     except (OSError, ValueError):
         _debug("connect_user() could not resolve local IP")
         st.session_state["login_error"] = "Could not resolve local IP address."
@@ -595,7 +632,6 @@ def connect_user(username: str, chat_password: str) -> None:
     try:
         database_helper.update_ip_address(account_id, ip_address)
         manager.connect_user(username, ip_address, st.session_state["session_id"])
-        _debug(f"connect_user() registered session for {username!r} with session_id={st.session_state['session_id']!r}")
     except Exception:
         _debug("connect_user() failed while updating IP or registering manager state")
         traceback.print_exc()
@@ -642,7 +678,6 @@ def render_welcome_page() -> None:
 
 
 def refresh_for_connection_polling(key: str) -> None:
-    _debug(f"refresh_for_connection_polling() called with key={key!r}")
     st.caption("Use the Refresh messages button to load the latest messages from the database.")
 
 
@@ -675,7 +710,6 @@ def cleanup_current_session() -> None:
 
 
 def main() -> None:
-    _debug("main() entered")
     st.set_page_config(page_title="Secure Chat", page_icon="\U0001F512", layout="wide")
     apply_blue_dark_theme()
     init_session_state()
@@ -684,7 +718,6 @@ def main() -> None:
     if not st.session_state["manager_started"]:
         try:
             database_helper.cache_data()
-            _debug("main() initial cache_data() succeeded")
         except Exception:
             _debug("main() initial cache_data() failed")
             traceback.print_exc()
@@ -698,31 +731,21 @@ def main() -> None:
             st.session_state["username"],
             st.session_state["session_id"],
         )
-        _debug(f"main() heartbeat sent for user={st.session_state['username']!r}")
 
-    # Process events FIRST — a close_chat event sets connected=False so the
-    # IP-count block below is skipped, landing directly on the welcome page
-    # with no "waiting" flash in between.
+    
     needs_rerun = process_events()
-    _debug(f"main() process_events() returned needs_rerun={needs_rerun}")
-
-    # Only run IP-count logic when still connected after event processing.
     if st.session_state["connected"]:
         try:
             database_helper.cache_data(include_chatlogs=False)
             all_ids = database_helper.get_all_account_ids()
             active_ip_count = sum(1 for aid in all_ids if database_helper.get_ip_address(aid))
-            _debug(f"main() active_ip_count={active_ip_count}")
             if active_ip_count >= 2 and not st.session_state["chat_open"]:
                 show_chat_screen()
                 needs_rerun = True
-                _debug("main() opened chat screen after detecting two active users")
         except Exception:
-            _debug("main() failed while checking active IP count")
             traceback.print_exc()
 
     if needs_rerun:
-        _debug("main() triggering rerun")
         st.rerun()
 
     if st.session_state["chat_open"]:
