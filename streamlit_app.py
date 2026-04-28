@@ -12,6 +12,7 @@ import streamlit as st
 from connection_state_manager import get_connection_manager
 import database_helper
 import msg_security
+import simulator
 from socket_chat_client import SocketChatClient
 
 
@@ -241,6 +242,7 @@ def init_session_state() -> None:
         "chat_messages": [],
         "pending_outgoing_message": "",
         "socket_client": None,
+        "local_ip": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -355,9 +357,16 @@ def _load_chat_messages_from_temp() -> list[dict[str, str]]:
         encrypted = item.get("encrypted", "")
         sender = item.get("sender", "")
         try:
+            # Canonical storage format is DES ciphertext.
             text = msg_security.decrypt_message(encrypted)
         except Exception:
-            text = ""
+            # Backward compatibility for any accidentally stored RSA payloads.
+            try:
+                account_id = st.session_state.get("account_id")
+                des_encrypted = msg_security.RSA_decrypt(encrypted, account_id)
+                text = msg_security.decrypt_message(des_encrypted)
+            except Exception:
+                text = ""
         if sender and text:
             messages.append({"sender": sender, "text": text})
     return messages
@@ -387,16 +396,23 @@ def _pull_incoming_socket_messages() -> None:
         return
     for payload in incoming:
         sender = str(payload.get("sender", "")).strip()
-        encrypted = str(payload.get("encrypted", "")).strip()
+        encrypted = payload.get("encrypted", "")
         if not sender or not encrypted:
             continue
         try:
-            text = msg_security.decrypt_message(encrypted)
+            account_id = st.session_state.get("account_id")
+            des_encrypted = msg_security.RSA_decrypt(encrypted, account_id)  # rsa{des{msg}} -> des{msg}
+            simulator.log("rsa", True, [str(encrypted), str(des_encrypted)])
+            text = msg_security.decrypt_message(des_encrypted)  # des{msg} -> msg
+            simulator.log("des", True, [str(des_encrypted), str(text)])
         except Exception:
             continue
+        my_ip = st.session_state.get("local_ip", "")
+        my_port = str(getattr(client, "port", ""))
+        simulator.log("msg", True, ["peer", f"{my_ip}:{my_port}", str(payload)])
         st.session_state["chat_messages"].append({"sender": sender, "text": text})
-        # Keep encrypted chat cache synchronized locally.
-        _append_encrypted_to_temp(sender, encrypted)
+        # Store only DES ciphertext in local cache and DB.
+        _append_encrypted_to_temp(sender, des_encrypted)
         if sender != my_username:
             st.session_state["pending_outgoing_message"] = ""
 
@@ -485,6 +501,7 @@ def render_chat_screen() -> None:
                 _debug("Failed to clear IP address during disconnect")
                 traceback.print_exc()
         _sync_chatlogs_to_db_safe()
+        simulator.log("login", True, [my_username])
 
         _get_socket_chat_client().stop()
         st.session_state["socket_client"] = None
@@ -511,9 +528,21 @@ def render_chat_screen() -> None:
             return
 
         encrypted = msg_security.encrypt_message(outgoing_message.strip())
-        payload = {"sender": my_username, "encrypted": encrypted}
+        simulator.log("des", False, [outgoing_message.strip(), str(encrypted)])
+        receiver, _ = _get_other_user_connection(my_username)
+        rsa_encrypted = msg_security.RSA_encrypt(encrypted, receiver)
+        simulator.log("rsa", False, [str(encrypted), str(rsa_encrypted)])
+        
+        payload = {"sender": my_username, "encrypted": rsa_encrypted}
         sent = socket_client.queue_message(payload)
         if sent:
+            my_ip = st.session_state.get("local_ip", "")
+            my_port = str(getattr(socket_client, "port", ""))
+            simulator.log(
+                "msg",
+                False,
+                [f"{my_ip}:{my_port}", f"{other_ip}:{other_port}", str(payload)],
+            )
             st.session_state["chat_messages"].append({"sender": my_username, "text": outgoing_message.strip()})
             _append_encrypted_to_temp(my_username, encrypted)
             st.session_state["pending_outgoing_message"] = outgoing_message.strip()
@@ -550,6 +579,8 @@ def connect_user(username: str, chat_password: str) -> None:
         _debug(f"connect_user() password check failed for account_id={account_id!r}")
         st.session_state["login_error"] = "Invalid chat password."
         return
+    entered_hash = msg_security.hash_data(chat_password)
+    stored_hash = database_helper.get_password(account_id) or ""
 
     try:
         ip_address = get_local_ip_address()
@@ -574,9 +605,12 @@ def connect_user(username: str, chat_password: str) -> None:
     st.session_state["username"] = username
     st.session_state["account_id"] = account_id
     st.session_state["connected"] = True
+    st.session_state["local_ip"] = ip_address
     st.session_state["status_message"] = ""
     st.session_state["login_error"] = ""
     st.session_state["chat_messages"] = _load_chat_messages_from_temp()
+    simulator.log("login", False, [username])
+    simulator.log("sha1", False, [chat_password, entered_hash, stored_hash])
 
     socket_client = _get_socket_chat_client()
     socket_client.stop()
@@ -630,6 +664,7 @@ def cleanup_current_session() -> None:
         if account_id:
             database_helper.update_connection_info(account_id, None, None)
         _sync_chatlogs_to_db_safe()
+        simulator.log("login", True, [username])
         _get_socket_chat_client().stop()
         st.session_state["socket_client"] = None
         manager.disconnect_user(username, session_id)
