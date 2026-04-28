@@ -47,8 +47,8 @@ def update_password(account_id,new_password):
 #RSA (for msgs sent over sockets) ------------------------------------------------------------------------------------------------------------------- 
 
      
-def RSA_encrypt(plaintext,reciever_ip_address):
-   public_key=database_helper.get_public_key(reciever_ip_address)
+def RSA_encrypt(plaintext,receiver_ip_address):
+   public_key=database_helper.get_public_key(receiver_ip_address)
    public_key=Decrypt_keys(public_key) # originally encrypted with DES
    encrypted_msg=rsa.encrypt(public_key, plaintext)
    return encrypted_msg

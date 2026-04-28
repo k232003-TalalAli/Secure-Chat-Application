@@ -3,7 +3,6 @@ from firebase_admin import credentials, firestore
 import os
 import subprocess
 import platform
-from datetime import datetime, timezone
 from typing import Any, cast
 
 
@@ -38,8 +37,9 @@ def _init_firebase():
 _init_firebase()
 db = firestore.client()
 
-TEMP_APP_DATA = "app_data_temp.txt"
-TEMP_CHAT_DATA = "chat_data_temp.txt"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMP_APP_DATA = os.path.join(BASE_DIR, "app_data_temp.txt")
+TEMP_CHAT_DATA = os.path.join(BASE_DIR, "chat_data_temp.txt")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  INTERNAL DB HELPERS
@@ -69,6 +69,7 @@ def _write_app_data_temp(data: dict):
         lines.append(f"Username: {acc.get('username', '')}")
         lines.append(f"Password: {acc.get('password', '')}")
         lines.append(f"IP_address: {acc.get('ip_address') or 'None'}")
+        lines.append(f"Port: {acc.get('port') if acc.get('port') is not None else 'None'}")
         lines.append(f"Public Key: {acc.get('public_key', '')}")
         lines.append(f"Private Key: {acc.get('private_key', '')}")
     with open(TEMP_APP_DATA, "w") as f:
@@ -100,6 +101,9 @@ def _read_app_data_temp() -> dict:
             elif line.startswith("IP_address:"):
                 val = line.split("IP_address:", 1)[1].strip()
                 acc["ip_address"] = None if val == "None" else val
+            elif line.startswith("Port:"):
+                val = line.split("Port:", 1)[1].strip()
+                acc["port"] = None if val == "None" else int(val)    
             elif line.startswith("Public Key:"):
                 acc["public_key"] = line.split("Public Key:", 1)[1].strip()
             elif line.startswith("Private Key:"):
@@ -118,7 +122,7 @@ def _update_temp_field(account_id: str, field: str, value):
 #  CACHE: POPULATE (call once at startup)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def cache_data():
+def cache_data(include_chatlogs: bool = True):
     """Fetch everything from Firebase and write to temp files."""
     _debug("cache_data() started")
 
@@ -136,6 +140,7 @@ def cache_data():
             "username":    acc.get("username", ""),
             "password":    acc.get("password", ""),
             "ip_address":  acc.get("ip_address"),
+            "port":        acc.get("port"),
             "public_key":  acc.get("public_key", ""),
             "private_key": acc.get("private_key", ""),
         }
@@ -143,16 +148,17 @@ def cache_data():
     _write_app_data_temp({"des_key": des_key, "accounts": accounts})  # already hides itself
     _debug(f"cache_data() wrote {len(accounts)} accounts to local temp cache")
 
-    # ── chatlogs ──────────────────────────────────────────────────────────────
-    chat_doc = cast(Any, db.collection("chatlogs").document("data").get())
-    chat_doc_data = chat_doc.to_dict() if getattr(chat_doc, "exists", False) else {}
-    raw = (chat_doc_data or {}).get("content", "")
+    if include_chatlogs:
+        # ── chatlogs ──────────────────────────────────────────────────────────
+        chat_doc = cast(Any, db.collection("chatlogs").document("data").get())
+        chat_doc_data = chat_doc.to_dict() if getattr(chat_doc, "exists", False) else {}
+        raw = (chat_doc_data or {}).get("content", "")
 
-    _unhide(TEMP_CHAT_DATA)                                    # ← unhide first
-    with open(TEMP_CHAT_DATA, "w", encoding="utf-8") as f:
-        f.write(raw)
-    _hide(TEMP_CHAT_DATA)                                      # ← then re-hide
-    _debug("cache_data() updated local chat cache")
+        _unhide(TEMP_CHAT_DATA)
+        with open(TEMP_CHAT_DATA, "w", encoding="utf-8") as f:
+            f.write(raw)
+        _hide(TEMP_CHAT_DATA)
+        _debug("cache_data() updated local chat cache")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GET FROM CACHE (no DB traffic)
@@ -231,6 +237,19 @@ def update_private_key(account_id: str, new_key: str):
     _update_field(account_id, "private_key", new_key)
     _update_temp_field(account_id, "private_key", new_key)
 
+def get_connection_info(account_id: str) -> tuple[str | None, int | None]:
+    acc = _read_app_data_temp()["accounts"].get(str(account_id), {})
+    return acc.get("ip_address"), acc.get("port")
+
+def update_connection_info(account_id: str, ip: str | None, port: int | None):
+    _account_ref(account_id).set({
+        "ip_address": ip,
+        "port": port
+    }, merge=True)
+
+    _update_temp_field(account_id, "ip_address", ip)
+    _update_temp_field(account_id, "port", port)
+
 def update_account(account_id: str, account_dict: dict):
     _account_ref(account_id).set(account_dict, merge=True)
     data = _read_app_data_temp()
@@ -247,41 +266,20 @@ def update_chatlogs(raw_content: str):
     _hide(TEMP_CHAT_DATA)
 
 
-def append_chat_message(sender: str, text: str):
-    _debug(f"append_chat_message() sender={sender!r} text={text!r}")
-    try:
-        db.collection("chatlogs").document("data").collection("entries").add(
-            {
-                "sender": sender,
-                "text": text,
-                "created_at": datetime.now(timezone.utc),
-            }
-        )
-        _debug("append_chat_message() completed successfully")
-    except Exception as exc:
-        _debug(f"append_chat_message() failed: {exc}")
-        raise
+def append_chatlogs_temp_line(line: str):
+    _unhide(TEMP_CHAT_DATA)
+    existing = ""
+    if os.path.exists(TEMP_CHAT_DATA):
+        with open(TEMP_CHAT_DATA, "r", encoding="utf-8") as f:
+            existing = f.read()
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    existing += line
+    with open(TEMP_CHAT_DATA, "w", encoding="utf-8") as f:
+        f.write(existing)
+    _hide(TEMP_CHAT_DATA)
 
 
-def get_chat_messages() -> list[dict]:
-    _debug("get_chat_messages() started")
-    messages = []
-    try:
-        entries = (
-            db.collection("chatlogs")
-            .document("data")
-            .collection("entries")
-            .order_by("created_at")
-            .stream()
-        )
-        for doc in entries:
-            data = doc.to_dict() or {}
-            sender = str(data.get("sender", "")).strip()
-            text = str(data.get("text", "")).strip()
-            if sender and text:
-                messages.append({"sender": sender, "text": text})
-        _debug(f"get_chat_messages() loaded {len(messages)} messages")
-    except Exception as exc:
-        _debug(f"get_chat_messages() failed: {exc}")
-        raise
-    return messages
+def sync_chatlogs_from_temp_to_db():
+    raw_content = get_chatlogs() or ""
+    db.collection("chatlogs").document("data").set({"content": raw_content}, merge=True)

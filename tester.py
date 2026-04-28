@@ -3,7 +3,7 @@ import database_helper
 # Call once at startup — all subsequent gets are local, zero DB traffic
 database_helper.cache_data()
 
-# All reads come from temp files now
+database_helper.update_ip_address("1",None)
 print(database_helper.get_des_key())
 print(database_helper.get_username("1"))
 
