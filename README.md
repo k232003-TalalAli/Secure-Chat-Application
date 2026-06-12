@@ -1,4 +1,4 @@
-# SSD-Project
+# Secure Chat Application
 
 Small Streamlit-based secure chat prototype.
 
